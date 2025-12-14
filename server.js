@@ -35,22 +35,27 @@ console.log('🔧 ========== ENVIRONMENT CONFIGURATION ==========');
 console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
 console.log('JWT_SECRET:', process.env.JWT_SECRET ? 'Set' : '⚠️ NOT SET!');
 console.log('PORT:', process.env.PORT || 5000);
-console.log('MONGODB_URI:', process.env.MONGODB_URI || 'not set');
+console.log('MONGODB_URI:', process.env.MONGODB_URI ? 'Set (hidden for security)' : '⚠️ NOT SET!');
 console.log('================================================');
 
 // Check for required environment variables
-if (!process.env.JWT_SECRET) {
-  console.error('❌ CRITICAL ERROR: JWT_SECRET is not set in environment variables!');
-  console.error('   Please add JWT_SECRET to your .env file');
-  console.error('   Example: JWT_SECRET=your_super_secure_jwt_secret_key_here');
+const requiredEnvVars = ['JWT_SECRET', 'MONGODB_URI', 'ENCRYPTION_KEY'];
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.error('❌ CRITICAL ERROR: Missing required environment variables:');
+  missingVars.forEach(varName => {
+    console.error(`   - ${varName}`);
+  });
+  console.error('\n📝 Please add these to your environment variables');
   process.exit(1);
 }
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Use MONGODB_URI from environment or fallback to local
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/flyhii-indrasuite';
+// Get MongoDB URI from environment (required)
+const MONGODB_URI = process.env.MONGODB_URI;
 
 // Trust proxy (for rate limiting behind reverse proxy)
 app.set('trust proxy', 1);
@@ -81,7 +86,13 @@ app.use('/api/', apiLimiter);
 // MongoDB Connection
 const connectDB = async () => {
   try {
-    console.log(`🔗 Connecting to MongoDB: ${MONGODB_URI}`);
+    console.log('🔗 Connecting to MongoDB...');
+    
+    // Log partial URI for debugging (without password)
+    const uriForLog = MONGODB_URI.replace(/(mongodb\+srv:\/\/)([^:]+):([^@]+)/, (match, protocol, user, pass) => {
+      return `${protocol}${user}:****@`;
+    });
+    console.log(`📊 Using MongoDB: ${uriForLog}`);
     
     await mongoose.connect(MONGODB_URI, {
       useNewUrlParser: true,
@@ -93,23 +104,21 @@ const connectDB = async () => {
     console.log('✅ MongoDB Connected');
     console.log(`📊 Database: ${mongoose.connection.name}`);
     console.log(`🏷️  Host: ${mongoose.connection.host}`);
-    console.log(`📁 Port: ${mongoose.connection.port}`);
+    console.log(`📁 Port: ${mongoose.connection.port || 'default'}`);
   } catch (err) {
     console.error('❌ MongoDB Connection Error:', err.message);
     
     console.log('\n⚠️  MongoDB Connection Failed!');
     console.log('📝 Possible issues:');
-    console.log('   1. Check if MongoDB is running locally');
-    console.log('   2. Verify MongoDB service is started');
-    console.log('   3. Check MongoDB connection string format');
+    console.log('   1. Check MongoDB connection string format');
+    console.log('   2. Verify network access to MongoDB Atlas');
+    console.log('   3. Check if IP is whitelisted in MongoDB Atlas');
+    console.log('   4. Verify username and password');
     
-    // Platform-specific instructions
-    console.log('\n📝 Start MongoDB locally:');
-    console.log('   Windows: mongod  OR  net start MongoDB');
-    console.log('   Mac:     brew services start mongodb-community  OR  mongod');
-    console.log('   Linux:   sudo systemctl start mongodb  OR  mongod');
-    console.log('\n📝 Connection Details:');
-    console.log(`   URI: ${MONGODB_URI}`);
+    console.log('\n📝 For Render deployment:');
+    console.log('   1. Go to Dashboard -> Your Service -> Environment');
+    console.log('   2. Add MONGODB_URI with your connection string');
+    console.log('   3. Make sure Render IP is whitelisted in MongoDB Atlas');
     
     // Don't exit, let the server run without DB for now
     console.log('⚠️  Server will continue running without database connection');
@@ -143,20 +152,31 @@ app.get('/api/health', (req, res) => {
     database: dbStatus,
     environment: process.env.NODE_ENV || 'development',
     jwtSecretConfigured: !!process.env.JWT_SECRET,
-    port: PORT
+    mongoDbConfigured: !!process.env.MONGODB_URI,
+    port: PORT,
+    nodeVersion: process.version
   });
 });
 
-// Test JWT endpoint
-app.get('/api/test-jwt', (req, res) => {
-  const jwtSecret = process.env.JWT_SECRET;
+// Environment info endpoint (for debugging)
+app.get('/api/env-info', (req, res) => {
+  // Return environment info without sensitive data
+  const envInfo = {
+    nodeEnv: process.env.NODE_ENV,
+    port: process.env.PORT,
+    mongoDbConfigured: !!process.env.MONGODB_URI,
+    jwtSecretConfigured: !!process.env.JWT_SECRET,
+    encryptionKeyConfigured: !!process.env.ENCRYPTION_KEY,
+    allowedOrigins: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').length + ' origins' : 'not set',
+    terraformDir: process.env.TERRAFORM_WORKSPACE_DIR,
+    disableRateLimit: process.env.DISABLE_RATE_LIMIT === 'true',
+    emailConfigured: !!(process.env.EMAIL_USER && process.env.EMAIL_PASSWORD),
+    stripeConfigured: !!process.env.STRIPE_SECRET_KEY,
+    nodeVersion: process.version,
+    platform: process.platform
+  };
   
-  res.json({
-    jwtSecretConfigured: !!jwtSecret,
-    jwtSecretLength: jwtSecret ? jwtSecret.length : 0,
-    message: jwtSecret ? 'JWT_SECRET is configured' : 'JWT_SECRET is missing',
-    environment: process.env.NODE_ENV || 'development'
-  });
+  res.json(envInfo);
 });
 
 app.get('/', (req, res) => {
@@ -166,19 +186,49 @@ app.get('/', (req, res) => {
     status: 'running',
     environment: process.env.NODE_ENV || 'development',
     database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+    documentation: {
+      health: '/api/health',
+      envInfo: '/api/env-info',
+      auth: '/api/auth/*',
+      deploy: '/api/deploy/*',
+      aws: '/api/aws/*'
+    }
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('🔥 Server Error:', err.message);
+  console.error(err.stack);
+  
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Route not found',
+    path: req.path,
+    method: req.method,
     timestamp: new Date().toISOString()
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+  console.log(`\n🚀 Server running on port: ${PORT}`);
   console.log(`⚡ Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔐 JWT Secret: ${process.env.JWT_SECRET ? 'Configured' : '❌ NOT CONFIGURED!'}`);
-  console.log(`🗄️  MongoDB: ${MONGODB_URI}`);
+  console.log(`🔐 JWT Secret: ${process.env.JWT_SECRET ? 'Configured ✓' : '❌ NOT CONFIGURED!'}`);
+  console.log(`🗄️  MongoDB: ${process.env.MONGODB_URI ? 'Configured ✓' : '❌ NOT CONFIGURED!'}`);
+  console.log(`🔑 Encryption Key: ${process.env.ENCRYPTION_KEY ? 'Configured ✓' : '❌ NOT CONFIGURED!'}`);
   console.log(`\n📋 Available endpoints:`);
-  console.log(`   • http://localhost:${PORT}/ - API status`);
-  console.log(`   • http://localhost:${PORT}/api/health - Health check`);
-  console.log(`   • http://localhost:${PORT}/api/test-jwt - JWT configuration test`);
-  console.log(`   • http://localhost:${PORT}/api/auth/* - Authentication endpoints`);
-  console.log(`   • http://localhost:${PORT}/api/dev/* - Development endpoints`);
+  console.log(`   • Health check: /api/health`);
+  console.log(`   • Environment info: /api/env-info`);
+  console.log(`   • Authentication: /api/auth/*`);
+  console.log(`   • Deployment: /api/deploy/*`);
+  console.log(`   • AWS: /api/aws/*`);
+  console.log(`\n⚠️  NOTE: For production, ensure all environment variables are properly set!`);
 });
