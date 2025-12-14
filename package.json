@@ -32,6 +32,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.0.3",
+    "resend": "^6.6.0",
     "nodemailer": "^7.0.11",
     "simple-git": "^3.20.0",
     "uuid": "^9.0.1"
