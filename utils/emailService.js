@@ -1,4 +1,3 @@
-import axios from 'axios';
 
 // Email service for sending OTPs - Uses Brevo API (no SMTP)
 // Email service for sending OTPs - Uses only native fetch API
