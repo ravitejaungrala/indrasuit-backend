@@ -12,6 +12,32 @@ import { auditLogger, logFailedAuth } from '../middleware/auditLogger.js';
 
 const router = express.Router();
 
+// Bcrypt configuration - optimized for Render
+const BCRYPT_ROUNDS = process.env.BCRYPT_ROUNDS ? 
+  parseInt(process.env.BCRYPT_ROUNDS) : 
+  (process.env.NODE_ENV === 'production' ? 8 : 6);
+
+console.log(`🔧 Bcrypt configuration: ${BCRYPT_ROUNDS} rounds`);
+
+// Helper function for bcrypt with timeout
+const bcryptCompareWithTimeout = async (plainPassword, hashedPassword) => {
+  return new Promise((resolve, reject) => {
+    // Set a 3-second timeout for bcrypt comparison (Render free tier can be slow)
+    const timeout = setTimeout(() => {
+      reject(new Error('Password comparison timeout - server is busy'));
+    }, 3000);
+
+    bcrypt.compare(plainPassword, hashedPassword, (err, result) => {
+      clearTimeout(timeout);
+      if (err) {
+        reject(err);
+      } else {
+        resolve(result);
+      }
+    });
+  });
+};
+
 // Sign Up - Step 1: Create account and send OTP
 router.post('/signup', 
   authLimiter,
@@ -87,21 +113,22 @@ router.post('/signup',
 
         // Send OTP via email
         console.log(`📧 Sending Signup OTP to ${email}: ${otp}`);
-        await sendOTPEmail(email, otp, 'signup');
+        const emailSent = await sendOTPEmail(email, otp, 'signup');
 
         return res.status(200).json({
           success: true,
-          message: 'Verification OTP sent to your email',
+          message: emailSent ? 'Verification OTP sent to your email' : 'OTP generated. Check console/logs.',
           email,
           needsVerification: true,
-          unverifiedUser: true
+          unverifiedUser: true,
+          otp: process.env.NODE_ENV === 'development' ? otp : undefined
         });
       }
     }
 
-    // Create new user
-    const saltRounds = process.env.NODE_ENV === 'development' ? 6 : 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    // Create new user with optimized bcrypt rounds
+    console.log(`🔐 Hashing password with ${BCRYPT_ROUNDS} rounds...`);
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
     
     // Create user but mark as unverified
     const user = new User({ 
@@ -152,12 +179,13 @@ router.post('/signup',
 
     // Send OTP via email
     console.log(`📧 Sending Signup OTP to ${email}: ${otp}`);
-    await sendOTPEmail(email, otp, 'signup');
+    const emailSent = await sendOTPEmail(email, otp, 'signup');
 
     res.status(201).json({
       success: true,
-      message: 'Account created! Please verify your email.',
+      message: emailSent ? 'Account created! Please verify your email.' : 'Account created! OTP generated. Check console/logs.',
       email,
+      otp: process.env.NODE_ENV === 'development' ? otp : undefined,
       nextStep: 'check_email'
     });
   } catch (error) {
@@ -260,19 +288,16 @@ router.post('/verify-signup-otp',
     user.defaultOrganizationId = organization._id;
     await user.save();
 
-    // Enhanced logging for signup completion
     console.log('\n✅ ========== SIGNUP COMPLETED ==========');
     console.log(`👤 New User: ${user.name} (${user.email})`);
     console.log(`🆔 User ID: ${user._id}`);
     console.log(`🏢 Organization: ${organization.name}`);
-    console.log(`🌐 IP Address: ${req.ip || req.connection.remoteAddress}`);
     console.log(`🕐 Time: ${new Date().toLocaleString()}`);
-    console.log(`📧 Email Verified: Yes`);
     console.log('========================================\n');
 
     res.json({
       success: true,
-      message: 'Account verified successfully! You can now login with your email and password.',
+      message: 'Account verified successfully! You can now login.',
       user: { 
         id: user._id, 
         email: user.email,
@@ -289,86 +314,14 @@ router.post('/verify-signup-otp',
     console.error('❌ OTP verification error:', error);
     res.status(500).json({ 
       success: false,
-      error: 'OTP verification failed',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      error: 'OTP verification failed'
     });
   }
 });
 
-// Resend Signup OTP
-router.post('/resend-signup-otp',
-  authLimiter,
-  validateEmail,
-  async (req, res) => {
-  try {
-    const { email } = req.body;
+// ==================== PASSWORD LOGIN ====================
 
-    if (!email) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Email is required' 
-      });
-    }
-
-    // Find user (case insensitive)
-    const user = await User.findOne({ 
-      email: { $regex: new RegExp(`^${email}$`, 'i') } 
-    });
-    
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
-
-    if (user.emailVerified) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Account already verified' 
-      });
-    }
-
-    // Generate new OTP
-    const otp = generateOTP();
-
-    // Delete any existing signup OTPs for this email
-    await OTP.deleteMany({ 
-      email: { $regex: new RegExp(`^${email}$`, 'i') }, 
-      type: 'signup' 
-    });
-
-    // Save new OTP
-    await OTP.create({
-      email: email.toLowerCase(),
-      otp,
-      type: 'signup',
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000)
-    });
-
-    // Send OTP via email
-    console.log(`📧 Resending Signup OTP to ${email}: ${otp}`);
-    const emailSent = await sendOTPEmail(email, otp, 'signup');
-
-    res.json({
-      success: true,
-      message: emailSent ? 
-        'New OTP sent to your email' : 
-        'New OTP generated. Check console for OTP.',
-      email
-    });
-  } catch (error) {
-    console.error('❌ Resend OTP error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to resend OTP'
-    });
-  }
-});
-
-// ==================== PASSWORD LOGIN WITH MANDATORY OTP ====================
-
-// Step 1: Verify Password and Send OTP (MANDATORY for all users)
+// Step 1: Verify Password and Send OTP
 router.post('/login', 
   authLimiter,
   validateEmail,
@@ -383,6 +336,8 @@ router.post('/login',
         error: 'Email and password are required' 
       });
     }
+
+    console.log(`🔐 Login attempt for: ${email}`);
 
     // Find user (case insensitive)
     const user = await User.findOne({ 
@@ -406,8 +361,25 @@ router.post('/login',
       });
     }
 
-    // Verify password
-    const isValidPassword = await bcrypt.compare(password, user.password);
+    // Verify password with timeout
+    console.log(`🔐 Verifying password for ${email}...`);
+    const startTime = Date.now();
+    
+    let isValidPassword;
+    try {
+      isValidPassword = await bcryptCompareWithTimeout(password, user.password);
+    } catch (bcryptError) {
+      console.error(`❌ Bcrypt error: ${bcryptError.message}`);
+      return res.status(500).json({
+        success: false,
+        error: 'Authentication server is busy. Please try again.',
+        code: 'SERVER_BUSY'
+      });
+    }
+    
+    const endTime = Date.now();
+    console.log(`⏱️  Bcrypt time: ${endTime - startTime}ms`);
+    
     if (!isValidPassword) {
       await logFailedAuth(email, req.ip, req.get('user-agent'), 'Invalid password');
       return res.status(401).json({ 
@@ -416,8 +388,7 @@ router.post('/login',
       });
     }
 
-    // ==================== MANDATORY OTP FOR ALL USERS ====================
-    // Generate OTP for 2FA (MANDATORY)
+    // Generate OTP for 2FA
     const otp = generateOTP();
     
     // Check if OTP was recently sent
@@ -449,8 +420,8 @@ router.post('/login',
     });
 
     // Send OTP via email
-    console.log(`📧 Sending OTP for password login to ${email}: ${otp}`);
-    await sendOTPEmail(email, otp, 'login');
+    console.log(`📧 Sending OTP for ${email}: ${otp}`);
+    const emailSent = await sendOTPEmail(email, otp, 'login');
 
     // Generate temporary token for OTP verification step
     const tempToken = jwt.sign(
@@ -461,32 +432,34 @@ router.post('/login',
         step: 'pending_otp'
       },
       process.env.JWT_SECRET,
-      { expiresIn: '10m' } // 10 minutes for OTP entry
+      { expiresIn: '10m' }
     );
 
-    console.log('\n🔐 ========== PASSWORD VERIFIED (OTP SENT) ==========');
+    console.log('\n🔐 ========== PASSWORD VERIFIED ==========');
     console.log(`👤 User: ${user.name} (${user.email})`);
-    console.log(`🔑 Login Step: Password verified, OTP sent`);
-    console.log(`⏰ Temp token generated for OTP step`);
-    console.log('=====================================================\n');
+    console.log(`📧 Email sent: ${emailSent ? 'Yes' : 'No (check logs for OTP)'}`);
+    console.log(`⏰ Temp token generated`);
+    console.log('===========================================\n');
 
     return res.json({
       success: true,
-      message: 'Password verified. OTP sent to your email.',
+      message: emailSent ? 'Password verified. OTP sent to your email.' : 'Password verified. OTP generated. Check console/logs.',
       tempToken,
       email: user.email,
-      nextStep: 'verify_otp'
+      nextStep: 'verify_otp',
+      otp: process.env.NODE_ENV === 'development' ? otp : undefined
     });
   } catch (error) {
     console.error('❌ Password login error:', error);
     res.status(500).json({ 
       success: false,
-      error: 'Login failed'
+      error: 'Login failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Step 2: Verify OTP after Password (MANDATORY for all users)
+// Step 2: Verify OTP after Password
 router.post('/verify-login-otp', 
   authLimiter,
   validateOTP,
@@ -590,9 +563,8 @@ router.post('/verify-login-otp',
 
     console.log('\n✅ ========== LOGIN COMPLETED ==========');
     console.log(`👤 User: ${user.name} (${user.email})`);
-    console.log(`🔑 Login Method: Password + OTP (2FA)`);
+    console.log(`🔑 Login Method: Password + OTP`);
     console.log(`🆔 User ID: ${user._id}`);
-    console.log(`🌐 IP Address: ${req.ip || req.connection.remoteAddress}`);
     console.log(`🕐 Time: ${new Date().toLocaleString()}`);
     console.log('======================================\n');
 
@@ -623,7 +595,7 @@ router.post('/verify-login-otp',
   }
 });
 
-// Request OTP for OTP-only Login (Separate from password login)
+// Request OTP for OTP-only Login
 router.post('/request-otp', 
   authLimiter,
   validateEmail,
@@ -662,21 +634,21 @@ router.post('/request-otp',
     // Generate OTP
     const otp = generateOTP();
 
-    // Check if OTP was recently sent (prevent spam)
+    // Check if OTP was recently sent
     const recentOTP = await OTP.findOne({ 
       email: { $regex: new RegExp(`^${email}$`, 'i') }, 
       type: 'login',
-      createdAt: { $gt: new Date(Date.now() - 60 * 1000) } // Within last 1 minute
+      createdAt: { $gt: new Date(Date.now() - 60 * 1000) }
     });
 
     if (recentOTP) {
       return res.status(429).json({ 
         success: false,
-        error: 'OTP already sent. Please wait 1 minute before requesting again.' 
+        error: 'OTP already sent. Please wait 1 minute.' 
       });
     }
 
-    // Delete any existing login OTPs for this email
+    // Delete any existing login OTPs
     await OTP.deleteMany({ 
       email: { $regex: new RegExp(`^${email}$`, 'i') }, 
       type: 'login' 
@@ -687,18 +659,18 @@ router.post('/request-otp',
       email: email.toLowerCase(),
       otp,
       type: 'login',
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000) // 10 minutes
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000)
     });
 
     // Send OTP via email
-    console.log(`📧 Sending OTP-only login OTP to ${email}: ${otp}`);
-    await sendOTPEmail(email, otp, 'login');
+    console.log(`📧 Sending OTP to ${email}: ${otp}`);
+    const emailSent = await sendOTPEmail(email, otp, 'login');
 
     res.json({ 
       success: true,
-      message: 'OTP sent to your email', 
+      message: emailSent ? 'OTP sent to your email' : 'OTP generated. Check console/logs.',
       email,
-      note: 'Check console logs if email not received'
+      otp: process.env.NODE_ENV === 'development' ? otp : undefined
     });
   } catch (error) {
     console.error('❌ Request OTP error:', error);
@@ -797,13 +769,12 @@ router.post('/verify-otp',
       { expiresIn: '30d' }
     );
 
-    console.log('\n✅ ========== OTP-ONLY LOGIN SUCCESS ==========');
+    console.log('\n✅ ========== OTP LOGIN SUCCESS ==========');
     console.log(`👤 User: ${user.name} (${user.email})`);
     console.log(`🔑 Login Method: OTP Only`);
     console.log(`🆔 User ID: ${user._id}`);
-    console.log(`🌐 IP Address: ${req.ip || req.connection.remoteAddress}`);
     console.log(`🕐 Time: ${new Date().toLocaleString()}`);
-    console.log('==============================================\n');
+    console.log('==========================================\n');
 
     res.json({
       success: true,
@@ -832,482 +803,65 @@ router.post('/verify-otp',
   }
 });
 
-// Forgot Password - Request OTP
-router.post('/forgot-password', async (req, res) => {
+// Debug login endpoint
+router.post('/debug-login', async (req, res) => {
   try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Email is required' 
-      });
+    const { email, password } = req.body;
+    
+    console.log(`🔍 Debug login for: ${email}`);
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
     }
-
-    // Find user (case insensitive)
+    
+    // Find user
     const user = await User.findOne({ 
       email: { $regex: new RegExp(`^${email}$`, 'i') } 
     });
     
     if (!user) {
-      // Don't reveal if user exists or not for security
-      return res.json({ 
-        success: true,
-        message: 'If the email exists, an OTP has been sent' 
-      });
-    }
-
-    // Generate OTP
-    const otp = generateOTP();
-
-    // Delete any existing reset OTPs for this email
-    await OTP.deleteMany({ 
-      email: { $regex: new RegExp(`^${email}$`, 'i') }, 
-      type: 'reset' 
-    });
-
-    // Save new OTP
-    await OTP.create({
-      email: email.toLowerCase(),
-      otp,
-      type: 'reset',
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000)
-    });
-
-    // Send OTP via email
-    await sendOTPEmail(email, otp, 'reset');
-
-    res.json({ 
-      success: true,
-      message: 'If the email exists, an OTP has been sent', 
-      email 
-    });
-  } catch (error) {
-    console.error('❌ Forgot password error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to process request'
-    });
-  }
-});
-
-// Reset Password with OTP
-router.post('/reset-password', async (req, res) => {
-  try {
-    const { email, otp, newPassword } = req.body;
-
-    if (!email || !otp || !newPassword) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Email, OTP, and new password are required' 
-      });
-    }
-
-    if (newPassword.length < 6) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Password must be at least 6 characters' 
-      });
-    }
-
-    // Find user (case insensitive)
-    const user = await User.findOne({ 
-      email: { $regex: new RegExp(`^${email}$`, 'i') } 
-    });
-    
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
-
-    // Find valid OTP (case insensitive)
-    const otpRecord = await OTP.findOne({
-      email: { $regex: new RegExp(`^${email}$`, 'i') },
-      otp,
-      type: 'reset',
-      verified: false,
-      expiresAt: { $gt: new Date() }
-    });
-
-    if (!otpRecord) {
-      return res.status(401).json({ 
-        success: false,
-        error: 'Invalid or expired OTP' 
-      });
-    }
-
-    // Mark OTP as verified
-    otpRecord.verified = true;
-    await otpRecord.save();
-
-    // Update password
-    const saltRounds = process.env.NODE_ENV === 'development' ? 6 : 10;
-    user.password = await bcrypt.hash(newPassword, saltRounds);
-    await user.save();
-
-    res.json({ 
-      success: true,
-      message: 'Password reset successfully' 
-    });
-  } catch (error) {
-    console.error('❌ Reset password error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to reset password'
-    });
-  }
-});
-
-// Get Profile
-router.get('/profile', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ 
-        success: false,
-        error: 'No token provided' 
-      });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
-    
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
-
-    res.json({ 
-      success: true,
-      user 
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message 
-    });
-  }
-});
-
-// Update Profile
-router.put('/profile', 
-  auditLogger('profile_updated', 'profile'),
-  async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ 
-        success: false,
-        error: 'No token provided' 
-      });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const { name, email, currentPassword, newPassword, profilePhoto } = req.body;
-
-    const user = await User.findById(decoded.userId);
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
-
-    // Update basic info
-    if (name !== undefined) user.name = name;
-    if (profilePhoto !== undefined) user.profilePhoto = profilePhoto;
-
-    // Update email if changed
-    if (email && email !== user.email) {
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        return res.status(409).json({ 
-          success: false,
-          error: 'Email already in use' 
-        });
-      }
-      user.email = email.toLowerCase();
-    }
-
-    // Update password if provided
-    if (newPassword) {
-      if (!currentPassword) {
-        return res.status(400).json({ 
-          success: false,
-          error: 'Current password required' 
-        });
-      }
-
-      const isValid = await bcrypt.compare(currentPassword, user.password);
-      if (!isValid) {
-        return res.status(401).json({ 
-          success: false,
-          error: 'Current password is incorrect' 
-        });
-      }
-
-      if (newPassword.length < 6) {
-        return res.status(400).json({ 
-          success: false,
-          error: 'New password must be at least 6 characters' 
-        });
-      }
-
-      const saltRounds = process.env.NODE_ENV === 'development' ? 6 : 10;
-      user.password = await bcrypt.hash(newPassword, saltRounds);
-    }
-
-    await user.save();
-
-    res.json({
-      success: true,
-      user: {
-        id: user._id,
-        email: user.email,
-        name: user.name,
-        profilePhoto: user.profilePhoto
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message 
-    });
-  }
-});
-
-// Refresh Token - Extend session without re-login
-router.post('/refresh-token', async (req, res) => {
-  try {
-    const { token } = req.body;
-    
-    if (!token) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Token required' 
-      });
+      return res.status(404).json({ error: 'User not found' });
     }
     
-    // Verify the old token (even if expired)
-    let decoded;
+    console.log(`✅ User found: ${user.email}`);
+    console.log(`🔑 Password hash exists: ${!!user.password}`);
+    console.log(`✅ Email verified: ${user.emailVerified}`);
+    
+    // Test bcrypt comparison
+    const startTime = Date.now();
+    let isValid;
     try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (error) {
-      // If token is expired, try to decode it anyway to get user info
-      if (error.name === 'TokenExpiredError') {
-        decoded = jwt.decode(token);
-      } else {
-        return res.status(401).json({ 
-          success: false,
-          error: 'Invalid token' 
-        });
-      }
-    }
-    
-    // Get user from database
-    const user = await User.findById(decoded.userId);
-    if (!user) {
-      return res.status(404).json({ 
+      isValid = await bcryptCompareWithTimeout(password, user.password);
+    } catch (bcryptError) {
+      console.error(`❌ Bcrypt timeout: ${bcryptError.message}`);
+      return res.json({
         success: false,
-        error: 'User not found' 
+        bcryptError: bcryptError.message,
+        time: Date.now() - startTime
       });
     }
     
-    // Generate new token with 30 days expiration
-    const newToken = jwt.sign(
-      { 
-        userId: user._id, 
-        email: user.email,
-        organizationId: user.defaultOrganizationId || user.organizationId
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
+    const endTime = Date.now();
+    
+    console.log(`⏱️  Bcrypt time: ${endTime - startTime}ms`);
+    console.log(`✅ Password valid: ${isValid}`);
     
     res.json({
-      success: true,
-      token: newToken,
-      user: {
-        id: user._id,
-        email: user.email,
-        name: user.name,
-        profilePhoto: user.profilePhoto
-      },
-      message: 'Token refreshed successfully'
+      success: isValid,
+      bcryptTime: endTime - startTime,
+      userExists: true,
+      emailVerified: user.emailVerified,
+      message: isValid ? 'Password valid' : 'Password invalid'
     });
     
   } catch (error) {
-    console.error('❌ Token refresh error:', error);
+    console.error('❌ Debug login error:', error.message);
     res.status(500).json({ 
-      success: false,
-      error: 'Failed to refresh token' 
+      error: error.message,
+      bcryptError: error.message.includes('timeout')
     });
   }
 });
 
-// Verify Token - Check if token is still valid
-router.post('/verify-token', async (req, res) => {
-  try {
-    const { token } = req.body;
-    
-    if (!token) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Token required' 
-      });
-    }
-    
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId);
-    
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
-    }
-    
-    res.json({
-      success: true,
-      valid: true,
-      user: {
-        id: user._id,
-        email: user.email,
-        name: user.name,
-        profilePhoto: user.profilePhoto
-      }
-    });
-    
-  } catch (error) {
-    res.status(401).json({ 
-      success: false,
-      valid: false, 
-      error: 'Invalid or expired token' 
-    });
-  }
-});
-
-// Get Authentication Logs (Admin/Development endpoint)
-router.get('/logs', 
-  authLimiter,
-  async (req, res) => {
-  try {
-    const { limit = 50, action, status, hours = 24 } = req.query;
-    
-    // Build query
-    const query = {
-      action: { 
-        $in: ['login', 'signup', 'signup_verified', 'otp_requested', 'login_failed', 'password_login'] 
-      }
-    };
-    
-    // Filter by specific action
-    if (action) {
-      query.action = action;
-    }
-    
-    // Filter by status
-    if (status) {
-      query.status = status;
-    }
-    
-    // Filter by time range
-    if (hours) {
-      const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-      query.timestamp = { $gte: since };
-    }
-    
-    const logs = await AuditLog.find(query)
-      .sort({ timestamp: -1 })
-      .limit(parseInt(limit))
-      .select('-__v');
-    
-    // Get summary statistics
-    const stats = await AuditLog.aggregate([
-      { $match: query },
-      {
-        $group: {
-          _id: '$action',
-          count: { $sum: 1 },
-          successCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] }
-          },
-          failureCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'failure'] }, 1, 0] }
-          }
-        }
-      }
-    ]);
-    
-    res.json({
-      success: true,
-      logs,
-      stats,
-      total: logs.length,
-      timeRange: `Last ${hours} hours`,
-      filters: { action, status, limit }
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message 
-    });
-  }
-});
-
-// Get Recent Login Activity
-router.get('/recent-activity', 
-  authLimiter,
-  async (req, res) => {
-  try {
-    const { limit = 20 } = req.query;
-    
-    const recentLogins = await AuditLog.find({
-      action: { $in: ['login', 'password_login'] },
-      status: 'success'
-    })
-    .sort({ timestamp: -1 })
-    .limit(parseInt(limit))
-    .select('userEmail action timestamp ipAddress details')
-    .lean();
-    
-    const formattedActivity = recentLogins.map(log => ({
-      email: log.userEmail,
-      method: log.action === 'password_login' ? 'Password' : 'OTP',
-      time: log.timestamp,
-      ipAddress: log.ipAddress,
-      timeAgo: getTimeAgo(log.timestamp)
-    }));
-    
-    res.json({
-      success: true,
-      recentActivity: formattedActivity,
-      total: formattedActivity.length
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message 
-    });
-  }
-});
-
-// Helper function to calculate time ago
-function getTimeAgo(timestamp) {
-  const now = new Date();
-  const diff = now - new Date(timestamp);
-  const minutes = Math.floor(diff / 60000);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  
-  if (days > 0) return `${days} day${days > 1 ? 's' : ''} ago`;
-  if (hours > 0) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
-  if (minutes > 0) return `${minutes} minute${minutes > 1 ? 's' : ''} ago`;
-  return 'Just now';
-}
-
+// Export router
 export default router;
