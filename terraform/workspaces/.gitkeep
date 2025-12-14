@@ -1,0 +1,2 @@
+# This folder stores Terraform workspaces for each deployment
+# Each deployment gets its own isolated workspace directory
